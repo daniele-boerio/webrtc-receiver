@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'kotlin-kapt'
+}
+
+android {
+    namespace 'com.example.webrtcclient'
+    compileSdk 34
+
+    sourceSets.main {
+        //jniLibs.srcDir 'libs/vecchie'
+        jniLibs.srcDir 'libs/nuove'
+        jni.srcDirs = [] //disable automatic ndk-build call
+    }
+    defaultConfig {
+        applicationId "com.example.webrtcclient"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            // 32位lib库（armeabi-v7a）已不再维护，请使用64位lib库（arm64-v8a）编译
+            // 32-bit library (armeabi-v7a) is no longer maintained, please use 64-bit library (arm64-v8a) to build!
+            //noinspection ChromeOsAbiSupport
+            abiFilters 'arm64-v8a'/*, 'armeabi-v7a'*/
+        }
+    }
+    buildFeatures {
+        viewBinding = true
+        dataBinding = true
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.10.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.core:core-ktx:+'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+
+    //webrtc
+    implementation ('io.socket:socket.io-client:2.1.0') {
+        // excluding org.json which is provided by Android
+        exclude group: 'org.json', module: 'json'
+    }
+
+    //implementation files('libs/vecchie/autobanh.jar')
+    //implementation files('libs/vecchie/base_java.jar')
+    //implementation files('libs/vecchie/libjingle_peerconnection.jar')
+    implementation files("libs/nuove/libwebrtc.jar")
+}
