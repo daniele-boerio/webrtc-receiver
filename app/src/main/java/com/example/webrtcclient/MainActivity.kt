@@ -3,15 +3,13 @@ package com.example.webrtcclient
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.util.Log
 import android.view.View
 import android.widget.TextView
 import android.widget.Toast
-import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -30,26 +28,25 @@ import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
+import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
-import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.net.URISyntaxException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 
 
 class MainActivity : AppCompatActivity() {
     private val tag = "com.example.webrtcclient.MainActivity"
 
     private val requestCode = 111
-    private val VIDEO_TRACK_ID = "ARDAMSv0"
     private val AUDIO_TRACK_ID = "ARDAMSa0"
-    private val VIDEO_RESOLUTION_WIDTH = 1280
-    private val VIDEO_RESOLUTION_HEIGHT = 720
-    private val FPS = 30
 
     private lateinit var binding: ActivityMainBinding
 
@@ -65,10 +62,6 @@ class MainActivity : AppCompatActivity() {
 
 
     private lateinit var audioConstraints: MediaConstraints
-    private lateinit var videoConstraints: MediaConstraints
-    private lateinit var sdpConstraints: MediaConstraints
-    private lateinit var videoSource: VideoSource
-    private lateinit var localVideoTrack: VideoTrack
     private lateinit var audioSource: AudioSource
     private lateinit var localAudioTrack: AudioTrack
     private lateinit var surfaceTextureHelper: SurfaceTextureHelper
@@ -76,11 +69,54 @@ class MainActivity : AppCompatActivity() {
     private lateinit var peerConnection: PeerConnection
     private lateinit var rootEglBase: EglBase
     private lateinit var factory: PeerConnectionFactory
-    private lateinit var videoTrackFromCamera: VideoTrack
-    private lateinit var audioManager : AudioManager
+    private lateinit var dataChannel : DataChannel
 
     private var mState = SigState.Disconnected
 
+    // For WebSocket connection retry
+    private val MAX_WS_CONNECT_RETRY_CNT = 3
+    private val WS_CONNECT_RETRY_WAITTIME: Long = 5000
+    private var mNeedRetry = false
+    private var mRetryCounter = 0
+    private var mHandler: Handler? = null
+
+    //observer for data channel
+    private val customDataChannelObserver = object : DataChannel.Observer {
+        override fun onBufferedAmountChange(amount: Long) {
+            // Handle buffered amount change events
+        }
+
+        override fun onStateChange() {
+            // Handle DataChannel state change events
+            if (dataChannel.state() == DataChannel.State.OPEN) {
+                // DataChannel is open and ready to use
+            }
+        }
+
+        override fun onMessage(buffer: DataChannel.Buffer) {
+            //todo
+            val data = buffer.data
+
+            // Converti il ByteBuffer a FloatBuffer con ordine LITTLE_ENDIAN
+            val floatBuffer = dataToFloatBuffer(data)
+
+            // Estrai i valori float dal FloatBuffer
+            val receivedFloats = FloatArray(floatBuffer.remaining())
+            floatBuffer.get(receivedFloats)
+
+            // Ora 'receivedFloats' contiene i tuoi 6 valori float
+            for (value in receivedFloats) {
+                Log.d(tag, "Float received: $value")
+            }
+        }
+
+        private fun dataToFloatBuffer(data: ByteBuffer): FloatBuffer {
+            // Convert the ByteBuffer to FloatBuffer
+            return data.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        }
+    }
+
+    //enum for signaling state
     private enum class SigState {
         Disconnected,
         Connecting,
@@ -102,11 +138,18 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         val view = binding.root
         setContentView(view)
+
+        //start the process
         start()
     }
 
-    override fun onStop() {
-        super.onStop()
+    override fun onDestroy() {
+        super.onDestroy()
+        /*
+         * Connection with the signaling server terminated
+         */
+        mNeedRetry = false
+        mRetryCounter = 0
         socket.disconnect()
         peerConnection.dispose()
         factory.dispose()
@@ -114,27 +157,50 @@ class MainActivity : AppCompatActivity() {
 
     private fun start() {
 
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        // Set the audio stream to STREAM_MUSIC to use the media speaker
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
 
+        //if camera has mic and video permission start the process
         if(hasPermissions()){
             initializeSurfaceViews()
             initializePeerConnectionFactory()
             createVideoTrackFromCameraAndShowIt()
             initializePeerConnections()
             connectToSignallingServer()
+
+            mNeedRetry = true
+            mRetryCounter = 0
+            mHandler = Handler()
+
         }else{
             requestPermissions()
         }
     }
 
+    //restart all the process if someone disconnect from the call
+    private fun restart(){
+        initializeVariables()
+        clearview()
+        initializePeerConnectionFactory()
+        createVideoTrackFromCameraAndShowIt()
+        initializePeerConnections()
+        connectToSignallingServer()
+    }
+
+    private fun initializeVariables(){
+        mNeedRetry = false
+        mRetryCounter = 0
+        isInitiator = false
+        isChannelReady = false
+        isStarted = false
+        socket.disconnect()
+        peerConnection.dispose()
+        factory.dispose()
+    }
+    private fun clearview(){
+        binding.statusLabel.text = ""
+    }
+
     private fun connectToSignallingServer() {
         try {
-
-            /*val URL = "http://192.168.1.92:3030"
-            options = IO.Options.builder()
-                .build()*/
 
             val URL = "https://develop.ewlab.di.unimi.it/"
 
@@ -155,6 +221,7 @@ class MainActivity : AppCompatActivity() {
 
                 Log.d(tag,"connectToSignallingServer: connect")
                 socket.emit("create or join", room)
+                mNeedRetry = false
                 changeState(SigState.Connected)
 
             }.on("created") {
@@ -173,18 +240,10 @@ class MainActivity : AppCompatActivity() {
                 Log.d(tag,"connectToSignallingServer: join")
                 isChannelReady = true
                 changeState(SigState.Joining)
-                startStreamingVideo()
 
-            }.on("joined") {
-
-                Log.d(tag,"connectToSignallingServer: joined")
-                changeState(SigState.Joined)
-                isChannelReady = true
-
-            }.on("log") { args: Array<Any> ->
-
-                for (arg in args) {
-                    Log.d(tag,"connectToSignallingServer: $arg")
+                //if the call isn't started yet, start the transmission
+                if (!isStarted){
+                    startStreamingVideo()
                 }
 
             }.on("message") { args: Array<Any> ->
@@ -192,6 +251,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val message = args[0] as JSONObject
                     if (message.getString("type") == "offer") {
+                        //received an offer, set the remote description and do an answer
                         Log.d(
                             tag,
                             "connectToSignallingServer: received an offer $isInitiator $isStarted"
@@ -201,14 +261,23 @@ class MainActivity : AppCompatActivity() {
                             maybeStart()
                         }
                         peerConnection.setRemoteDescription(
-                            SimpleSdpObserver(),
+                            object : SimpleSdpObserver() {
+
+                                override fun onSetFailure(s: String) {
+                                    Log.d(tag, "onSetFailure: $s")
+                                }
+
+                                override fun onSetSuccess() {
+                                    doAnswer()
+                                }
+                            },
                             SessionDescription(
                                 SessionDescription.Type.OFFER,
                                 message.getString("sdp")
                             )
                         )
-                        doAnswer()
                     } else if (message.getString("type") == "answer" && isStarted) {
+                        //received an answer, set the remote description
                         changeState(SigState.ReceivedAnswer)
                         peerConnection.setRemoteDescription(
                             SimpleSdpObserver(),
@@ -218,10 +287,8 @@ class MainActivity : AppCompatActivity() {
                             )
                         )
                     } else if (message.getString("type") == "candidate" && isStarted) {
-                        Log.d(
-                            tag,
-                            "connectToSignallingServer: receiving candidates"
-                        )
+                        //received a candidate, add the candidate to the peerConnection
+                        Log.d(tag,"connectToSignallingServer: receiving candidates")
                         changeState(SigState.ReceivedCandidate)
                         val candidate = IceCandidate(
                             message.getString("id"),
@@ -234,14 +301,10 @@ class MainActivity : AppCompatActivity() {
                     e.printStackTrace()
                     Log.e(tag, e.toString())
                 }
-            }.on(
-                Socket.EVENT_DISCONNECT
-            ) {
-                Log.d(
-                    tag,
-                    "connectToSignallingServer: disconnect"
-                )
-                changeState(SigState.Disconnected)
+            }.on(Socket.EVENT_DISCONNECT) {
+                //this client is disconnecting...
+                Log.d(tag,"connectToSignallingServer: disconnect")
+                disconnected()
             }
             socket.connect()
         } catch (e: URISyntaxException) {
@@ -250,26 +313,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun disconnected(){
+
+        // Retry at connection failure, after specified seconds
+        if (mNeedRetry) {
+            if (++mRetryCounter < MAX_WS_CONNECT_RETRY_CNT) {
+                val retryConnection = Runnable {
+                    connectToSignallingServer()
+                }
+                mHandler?.postDelayed(retryConnection, WS_CONNECT_RETRY_WAITTIME)
+            }else{
+                restart()
+            }
+        }else{
+            restart()
+        }
+    }
+
     //MirtDPM4
     private fun doAnswer() {
+        //set the local description and send the answer to the sender
+        val sdpMediaConstraints = MediaConstraints()
         peerConnection.createAnswer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
-                peerConnection.setLocalDescription(SimpleSdpObserver(), sessionDescription)
-                val message = JSONObject()
-                try {
-                    message.put("type", "answer")
-                    message.put("room", room)
-                    message.put("sdp", sessionDescription.description)
-                    sendMessage(message)
-                } catch (e: JSONException) {
-                    e.printStackTrace()
-                    Log.e(tag, e.toString())
-                }
+                peerConnection.setLocalDescription(object : SimpleSdpObserver() {
+                    override fun onSetSuccess() {
+                        val message = JSONObject()
+                        try {
+                            message.put("type", "answer")
+                            message.put("room", room)
+                            message.put("sdp", sessionDescription.description)
+                            Log.d(tag, "answer sent: $message")
+                            sendMessage(message)
+                        } catch (e: JSONException) {
+                            e.printStackTrace()
+                            Log.e(tag, e.toString())
+                        }
+                    }
+                }, sessionDescription)
             }
-        }, MediaConstraints())
+        }, sdpMediaConstraints)
     }
 
     private fun maybeStart() {
+        //if the channel is ready, it's not started and i'm the initiator, create an offer
         Log.d(tag, "maybeStart: $isStarted $isChannelReady")
         if (!isStarted && isChannelReady) {
             isStarted = true
@@ -280,13 +367,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun doCall() {
-        val sdpMediaConstraints = MediaConstraints()
-        sdpMediaConstraints.mandatory.add(
-            MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true")
-        )
-        sdpMediaConstraints.mandatory.add(
-            MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true")
-        )
+        //create an offer and send it
         changeState(SigState.Offering)
         peerConnection.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(sessionDescription: SessionDescription) {
@@ -303,7 +384,7 @@ class MainActivity : AppCompatActivity() {
                     Log.e(tag, e.toString())
                 }
             }
-        }, sdpMediaConstraints)
+        }, MediaConstraints())
     }
 
     private fun sendMessage(message: Any) {
@@ -347,6 +428,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun initializePeerConnections() {
         peerConnection = createPeerConnection(factory)!!
+
+        //create a dataChannel
+        val init = DataChannel.Init()
+
+        init.ordered = false    //set on false for one direction transmission
+
+        init.maxRetransmits = 0 //set on 0 for no retransmission
+
+        dataChannel = peerConnection.createDataChannel("sensors", init)
+
+        dataChannel.registerObserver(customDataChannelObserver)
     }
 
     private fun startStreamingVideo() {
@@ -354,15 +446,20 @@ class MainActivity : AppCompatActivity() {
         mediaStream.addTrack(localAudioTrack) // Assuming localAudioTrack is a MediaStreamTrack
         peerConnection.addTrack(localAudioTrack, listOf(mediaStream.id)) // Add the audio track
 
+        //IMPORTANT -> set the transceiver for letting know the peerConnection that we are sending and we want audio and not sending video but expecting that
+
+        val audioTransceiver = peerConnection.addTransceiver(localAudioTrack)
+
+        val videoTransceiver = peerConnection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
+
+        audioTransceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+
+        videoTransceiver.setDirection(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+
         maybeStart()
     }
 
     private fun createPeerConnection(factory: PeerConnectionFactory?): PeerConnection? {
-        val iceServers = mutableListOf<PeerConnection.IceServer>()
-        val url = "stun:stun.l.google.com:19302"
-        iceServers.add(PeerConnection.IceServer.builder(url).createIceServer())
-        val rtcConfig = PeerConnection.RTCConfiguration(iceServers)
-        val pcConstraints = MediaConstraints()
         val pcObserver: PeerConnection.Observer =
             object : PeerConnection.Observer {
                 override fun onSignalingChange(signalingState: PeerConnection.SignalingState) {
@@ -371,6 +468,9 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onIceConnectionChange(iceConnectionState: PeerConnection.IceConnectionState) {
                     Log.d(tag, "onIceConnectionChange: $iceConnectionState")
+                    if(iceConnectionState == PeerConnection.IceConnectionState.DISCONNECTED){
+                        restart()
+                    }
                 }
 
                 override fun onIceConnectionReceivingChange(b: Boolean) {
@@ -413,6 +513,8 @@ class MainActivity : AppCompatActivity() {
 
                 override fun onDataChannel(dataChannel: DataChannel) {
                     Log.d(tag, "onDataChannel: ")
+
+                    dataChannel.registerObserver(customDataChannelObserver)
                 }
 
                 override fun onRenegotiationNeeded() {
@@ -439,8 +541,11 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-        return factory!!.createPeerConnection(rtcConfig, pcConstraints, pcObserver)
+        val url = "stun:stun.l.google.com:19302"
+        val iceServers = listOf(PeerConnection.IceServer.builder(url).createIceServer())
+        return factory!!.createPeerConnection(iceServers, pcObserver)
     }
+
 
     private fun handleIncomingAudioTrack(audioTrack: AudioTrack) {
         audioTrack.setEnabled(true)
@@ -448,6 +553,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleIncomingVideoTrack(videoTrack: VideoTrack) {
         videoTrack.setEnabled(true)
+        //add the video received in the surfaceView
         videoTrack.addSink(binding.surfaceView2)
     }
 
